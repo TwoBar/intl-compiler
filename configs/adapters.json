@@ -1,0 +1,71 @@
+{
+  "base_model": "Qwen/Qwen2.5-Coder-3B-Instruct",
+  "adapter_repo": "bballin22/intl-adapters",
+  "training_data_repo": "bballin22/intl-training-pairs",
+  "phases": {
+    "0": {
+      "adapters": ["python_fastapi", "sql_postgres"],
+      "description": "Core adapters — highest priority"
+    },
+    "1": {
+      "adapters": ["python_django", "python_flask", "typescript_express", "sql_mysql"],
+      "description": "Extended web stack"
+    },
+    "2": {
+      "adapters": ["typescript_nextjs", "php_laravel", "php_vanilla", "javascript_vanilla", "html_jinja2", "html_blade", "css_tailwind"],
+      "description": "Frontend and PHP frameworks"
+    },
+    "3": {
+      "adapters": ["java_spring", "csharp_dotnet", "go_gin", "ruby_rails", "sql_tsql", "sql_sqlite"],
+      "description": "Enterprise and additional SQL"
+    },
+    "4": {
+      "adapters": ["swift_ios", "kotlin_android", "dart_flutter"],
+      "description": "Mobile targets"
+    },
+    "5": {
+      "adapters": ["rust_axum", "cpp_modern"],
+      "description": "Systems languages — highest complexity"
+    }
+  },
+  "adapters": {
+    "python_fastapi": {"pairs": 3000, "phase": 0, "threshold": 0.90},
+    "sql_postgres": {"pairs": 1500, "phase": 0, "threshold": 0.95},
+    "python_django": {"pairs": 2000, "phase": 1, "threshold": 0.90},
+    "python_flask": {"pairs": 1500, "phase": 1, "threshold": 0.90},
+    "typescript_express": {"pairs": 2500, "phase": 1, "threshold": 0.90},
+    "sql_mysql": {"pairs": 800, "phase": 1, "threshold": 0.95},
+    "typescript_nextjs": {"pairs": 2000, "phase": 2, "threshold": 0.90},
+    "php_laravel": {"pairs": 2500, "phase": 2, "threshold": 0.90},
+    "php_vanilla": {"pairs": 1500, "phase": 2, "threshold": 0.90},
+    "javascript_vanilla": {"pairs": 1500, "phase": 2, "threshold": 0.90},
+    "html_jinja2": {"pairs": 1000, "phase": 2, "threshold": 0.95},
+    "html_blade": {"pairs": 800, "phase": 2, "threshold": 0.95},
+    "css_tailwind": {"pairs": 600, "phase": 2, "threshold": 0.95},
+    "java_spring": {"pairs": 2500, "phase": 3, "threshold": 0.87},
+    "csharp_dotnet": {"pairs": 2000, "phase": 3, "threshold": 0.87},
+    "go_gin": {"pairs": 2000, "phase": 3, "threshold": 0.90},
+    "ruby_rails": {"pairs": 1500, "phase": 3, "threshold": 0.90},
+    "sql_tsql": {"pairs": 1000, "phase": 3, "threshold": 0.95},
+    "sql_sqlite": {"pairs": 600, "phase": 3, "threshold": 0.95},
+    "swift_ios": {"pairs": 2000, "phase": 4, "threshold": 0.87},
+    "kotlin_android": {"pairs": 2000, "phase": 4, "threshold": 0.87},
+    "dart_flutter": {"pairs": 1500, "phase": 4, "threshold": 0.87},
+    "rust_axum": {"pairs": 2500, "phase": 5, "threshold": 0.80},
+    "cpp_modern": {"pairs": 2000, "phase": 5, "threshold": 0.80}
+  },
+  "training": {
+    "quantisation": "4-bit NF4 QLoRA",
+    "lora_rank": 64,
+    "lora_alpha": 128,
+    "lora_dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "learning_rate": 2e-4,
+    "lr_schedule": "cosine",
+    "warmup_ratio": 0.05,
+    "batch_size": 4,
+    "gradient_accumulation": 4,
+    "epochs": 3,
+    "max_seq_length": 2048
+  }
+}

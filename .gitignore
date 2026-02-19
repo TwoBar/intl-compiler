@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.db
+*.sqlite
+.env
+.venv/
+venv/
+*.log
+data/*/train.jsonl
+data/*/val.jsonl
+.DS_Store
