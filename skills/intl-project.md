@@ -7,11 +7,27 @@ Small fine-tuned LoRA adapters (Qwen2.5-Coder-3B) compile INTL into production c
 
 Full spec: `/workspace/docs/INTL_Specification.md` — always read this before building any component.
 
-**Compilation pipeline:**
+**Full pipeline:**
 ```
-INTL source → Parser (Lark) → Semantic Index (SQLite) → LoRA Router → Compiler Engine → Validator
-                                                                                              ↓ fail
-                                                                               Frontier escalation (Claude)
+User Requirement (freeform)
+        ↓
+generator.py — decompose()        → Project Manifest (JSON)
+        ↓
+generator.py — generate_module()  → .intl files (one per module, parallel)
+        ↓
+parser.py    — parse()            → typed AST
+        ↓
+index.py     — index_module()     → SQLite semantic index
+        ↓
+router.py    — route()            → adapter name
+        ↓
+compiler.py  — compile()          → target code (LoRA 3B model)
+        ↓
+validator.py — validate()         → T1–T7 checks
+        ↓ fail
+escalation.py — escalate()        → corrected code (frontier Claude)
+        ↓
+generator.py — patch()            → PATCH blocks for incremental updates
 ```
 
 ---
@@ -187,6 +203,54 @@ Qwen2.5-Coder-3B + LoRA via transformers/peft. Temperature 0.1. Wraps output in 
 
 ### CLI → cli.py
 `intl compile`, `intl build`, `intl status`, `intl adapters`, `intl validate`
+
+### Generator → generator.py
+Frontier Claude layer that converts freeform requirements into INTL. Three functions:
+
+**decompose(requirement: str) → manifest: dict**
+- One Claude API call
+- System prompt: INTL architect role + compressed construct list
+- Output: JSON manifest with module list, IDs, profiles, dependency graph, shared types
+- Use prompt caching on the system prompt (cache_control: ephemeral)
+
+**generate_module(manifest: dict, module_spec: dict) → intl_source: str**
+- One Claude API call per module (run in parallel with asyncio.gather)
+- Context (with prompt caching on the first 3 sections):
+  1. Compressed INTL syntax reference (~3K tokens) ← cached
+  2. Project manifest (~2K tokens) ← cached
+  3. TYPE definitions from REQUIRES modules only ← cached per group
+  4. This module's spec (~1K tokens) ← not cached
+- Output: valid .intl source for the module
+- Write output to /workspace/intl/generated/<module_name>.intl
+- Commit each generated file
+
+**patch(module_intl: str, change_request: str) → patch_block: str**
+- One Claude API call
+- Context: existing INTL source (compact, not compiled output) + change request
+- Output: PATCH block targeting specific function/pipeline by ID
+- Only marks the patched node dirty in the semantic index
+
+Key rules:
+- IDs must be globally unique — read existing manifest to find next available ID
+- Never include compiled output in context — always use INTL source
+- Temperature 0 for deterministic output
+- Always validate generated INTL through parser.py before committing
+- Model: claude-sonnet-4-6 (use ANTHROPIC_API_KEY from env)
+
+### Escalation → escalation.py
+Frontier Claude layer that corrects failed LoRA compilations.
+
+**escalate(intl_block: str, failed_output: str, failing_checks: list, language: str, adapter: str, retry_count: int) → corrected_code: str**
+- Called by validator.py after retry budget exhausted
+- Builds structured escalation package (never freeform):
+  - Original INTL block
+  - Failed compiled output
+  - Failing check names + error messages
+  - Target language, adapter name, retry count
+- System prompt: "You are the INTL escalation compiler for {language} {profile}. Fix the failed output. Return ONLY code wrapped in INTL sentinels."
+- Output is written directly to semantic index (bypasses LoRA router)
+- Output is ALSO saved as a Category C training pair to /workspace/data/<adapter>/corrections.jsonl
+- Model: claude-sonnet-4-6
 
 ---
 

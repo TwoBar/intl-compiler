@@ -49,11 +49,12 @@ timeout_field:       "TIMEOUT"       DURATION _NL
 pipeline_block: "PIPELINE" NAME id_tag _NL function_field* body_stmt* "END" "PIPELINE" NAME id_tag _NL?
 
 // ─── TYPE ───
+// Fields are declared as bare   name : TypeExpr [modifiers]   (no FIELD keyword)
 type_block: "TYPE" NAME id_tag _NL type_field* "END" "TYPE" NAME id_tag _NL?
 type_field: field_decl
           | constraint_decl
 
-field_decl:      "FIELD" NAME ":" type_expr field_modifier* _NL
+field_decl:      NAME ":" type_expr field_modifier* _NL
 constraint_decl: "CONSTRAINT" expression _NL
 
 field_modifier: "NOT" "NULL" -> not_null
@@ -70,17 +71,25 @@ patch_block: "PATCH" patch_target NAME id_tag _NL patch_field* patch_op* "END" "
 patch_target: "FUNCTION" -> patch_function
             | "PIPELINE" -> patch_pipeline
 
+// Precondition label is either a bare identifier or a quoted string
 patch_field: intent_field
-           | "INSERT" "PRECONDITION" QUOTED_STRING _NL    -> insert_precondition
-           | "REMOVE" "PRECONDITION" QUOTED_STRING _NL    -> remove_precondition
+           | "INSERT" "PRECONDITION" name_or_str _NL    -> insert_precondition
+           | "REMOVE" "PRECONDITION" name_or_str _NL    -> remove_precondition
 
-patch_op: "INSERT" patch_position _NL body_stmt+ -> patch_insert
-        | "REPLACE" patch_position _NL body_stmt+ -> patch_replace
-        | "REMOVE" patch_position _NL              -> patch_remove
+// patch_op supports both:
+//   block form: INSERT BEFORE "..." \n body... END INSERT
+//   simple form: INSERT BEFORE "line WHERE intent MATCHES ..." \n body...  (legacy — no END)
+patch_op: "INSERT" patch_position _NL body_stmt+ "END" "INSERT" _NL? -> patch_insert
+        | "REPLACE" patch_position _NL body_stmt+ "END" "REPLACE" _NL? -> patch_replace
+        | "REMOVE" patch_position _NL "END" "REMOVE" _NL?              -> patch_remove
 
-patch_position: "AFTER" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING  -> after_line
-              | "BEFORE" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING -> before_line
-              | "AT" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING     -> at_line
+// Positions: shorthand (just a quoted string anchor) OR full line-intent form
+patch_position: "AFTER" QUOTED_STRING                                        -> after_line
+              | "BEFORE" QUOTED_STRING                                       -> before_line
+              | "AT" QUOTED_STRING                                           -> at_line
+              | "AFTER" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING     -> after_line
+              | "BEFORE" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING    -> before_line
+              | "AT" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING        -> at_line
 
 // ─── Body Statements (24 constructs) ───
 body_stmt: query_stmt
@@ -201,6 +210,8 @@ atom: QUOTED_STRING                              -> string_literal
 id_tag: "[" "id" "=" NAME "]"
 dotted_name: NAME ("." NAME)*
 name_list: NAME (NAME)*
+name_or_str: NAME          -> name_token
+           | QUOTED_STRING -> quoted_token
 field_list: "(" field_pair ("," field_pair)* ")"
 field_pair: NAME ":" expression
 arg_list: expression ("," expression)*

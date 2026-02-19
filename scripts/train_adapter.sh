@@ -11,8 +11,8 @@ set -euo pipefail
 
 ADAPTER="${1:?Usage: train_adapter.sh <adapter_name>}"
 DATA_DIR="data/${ADAPTER}"
-HF_REPO="bballin22/intl-adapters"
-TRAINING_REPO="bballin22/intl-training-pairs"
+HF_REPO="${HF_USERNAME}/intl-adapters"
+TRAINING_REPO="${HF_USERNAME}/intl-training-pairs"
 
 echo "═══════════════════════════════════════"
 echo "INTL Adapter Training: ${ADAPTER}"

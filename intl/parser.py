@@ -333,8 +333,10 @@ class ASTBuilder(Transformer):
     def patch_function(self, meta, items): return "function"
     def patch_pipeline(self, meta, items): return "pipeline"
     def patch_field(self, meta, items): return items[0]
-    def insert_precondition(self, meta, items): return ("insert_pre", _strip_quotes(items[0]))
-    def remove_precondition(self, meta, items): return ("remove_pre", _strip_quotes(items[0]))
+    def name_token(self, meta, items): return str(items[0])
+    def quoted_token(self, meta, items): return _strip_quotes(items[0])
+    def insert_precondition(self, meta, items): return ("insert_pre", items[0] if isinstance(items[0], str) else _strip_quotes(items[0]))
+    def remove_precondition(self, meta, items): return ("remove_pre", items[0] if isinstance(items[0], str) else _strip_quotes(items[0]))
     def patch_insert(self, meta, items): return PatchOp(action="insert", position=items[0][0], match_text=items[0][1], body=list(items[1:]), *_pos(meta))
     def patch_replace(self, meta, items): return PatchOp(action="replace", position=items[0][0], match_text=items[0][1], body=list(items[1:]), *_pos(meta))
     def patch_remove(self, meta, items): return PatchOp(action="remove", position=items[0][0], match_text=items[0][1], *_pos(meta))

@@ -1,7 +1,7 @@
 {
   "base_model": "Qwen/Qwen2.5-Coder-3B-Instruct",
-  "adapter_repo": "bballin22/intl-adapters",
-  "training_data_repo": "bballin22/intl-training-pairs",
+  "adapter_repo": "${HF_USERNAME}/intl-adapters",
+  "training_data_repo": "${HF_USERNAME}/intl-training-pairs",
   "phases": {
     "0": {
       "adapters": ["python_fastapi", "sql_postgres"],
