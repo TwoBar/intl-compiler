@@ -1,17 +1,29 @@
-"""INTL Training Data Generator (§5.1–5.4).
+"""INTL Training Data Generator — Two-Step Pipeline (§5.1–5.4).
 
-Generates JSONL training pairs for a given adapter using Claude.
-- Category A (~60%): Fresh INTL → target code
-- Category B (~30%): PATCH compilation
-- Category C (~10%): Error correction
+Two-step generation per pair:
+  Step 1: Frontier model writes syntactically valid INTL (spec in system prompt)
+  Step 2: Frontier model compiles INTL → production target-language code
 
-Output: /workspace/data/<adapter>/train.jsonl
-        /workspace/data/<adapter>/validation.jsonl
+Categories (§5.3 split):
+  A (60%): Fresh FUNCTION/PIPELINE → compiled target code       [2 API calls]
+  B (30%): Base INTL + PATCH block → patched compiled code      [4 API calls]
+  C (10%): INTL + broken compile + failing checks → correction  [3 API calls]
+
+Training pair format (§5.1):
+  {"system": "<adapter compiler sys>",
+   "prompt": "<INTL source block>",
+   "completion": "<compiled code with INTL:BEGIN/END sentinels>"}
 
 Usage:
-    python3 -m intl.datagen --adapter python_fastapi --count 3000 --val 200
-    python3 -m intl.datagen --adapter sql_postgres   --count 1500 --val 200
-    python3 -m intl.datagen --adapter python_fastapi --count 20          # smoke test
+    # Smoke test (fast)
+    python3 -m intl.datagen --adapter python_fastapi --count 20 --val 5
+
+    # Full run — always in background
+    nohup python3 -m intl.datagen --adapter python_fastapi --count 3000 --val 200 \\
+      > /workspace/data/python_fastapi/datagen.log 2>&1 &
+
+    # Resume interrupted run
+    python3 -m intl.datagen --adapter python_fastapi --count 3000 --val 200 --append
 """
 from __future__ import annotations
 
@@ -21,7 +33,6 @@ import json
 import logging
 import os
 import random
-import re
 import time
 from pathlib import Path
 
@@ -30,16 +41,17 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 2000
-CONCURRENCY = 2        # conservative — haiku has tighter rate limits
+MODEL       = "claude-sonnet-4-6"
+MAX_TOKENS  = 2048
+CONCURRENCY = 3      # 3 parallel pairs × up to 4 calls each = ≤12 concurrent requests
 MAX_RETRIES = 3
-RETRY_DELAY = 8
+RETRY_DELAY = 10     # base delay — doubles on rate limit
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent.parent / "data"
+SPEC_PATH = Path(__file__).parent.parent / "docs" / "INTL_Specification.md"
 
-# ── INTL constructs (§5.4) ────────────────────────────────────────────────────
+# ── INTL constructs ───────────────────────────────────────────────────────────
 CONSTRUCTS = [
     "QUERY", "PERSIST", "IF/THEN/ELSE", "FAIL", "RETURN",
     "LOOP", "EMIT", "SEQUENCE", "PARALLEL", "TRANSACTION",
@@ -48,7 +60,6 @@ CONSTRUCTS = [
     "OBSERVABLE", "CONFIDENCE", "TIMEOUT", "PATCH",
 ]
 HIGH_FREQ_CONSTRUCTS = {"PARALLEL", "FALLBACK", "TRANSACTION"}
-
 CATEGORY_WEIGHTS = [("A", 0.60), ("B", 0.30), ("C", 0.10)]
 
 DOMAINS = [
@@ -58,49 +69,82 @@ DOMAINS = [
     "audit logs", "file uploads", "webhooks", "api keys", "permissions",
 ]
 
+# ── Compact INTL syntax reference (inlined to avoid file dependency) ───────────
+INTL_SYNTAX_REF = """\
+INTL (Intent Language) Syntax Reference
 
-# ── INTL block examples for grounding ─────────────────────────────────────────
-INTL_EXAMPLE = """\
-FUNCTION login [id=f001]
-  INTENT       "validate credentials and return session token"
-  PRECONDITION email.length > 0
-  PRECONDITION password.length >= 8
-  POSTCONDITION result.token IS NOT NULL
-  READS        users_table
-  MUTATES      sessions_table
-  OBSERVABLE
+BLOCK TYPES:
+  FUNCTION <name> [id=<id>]
+    INTENT "<description>"
+    [PRECONDITION <expr>]
+    [POSTCONDITION <expr>]
+    [READS <table>]
+    [MUTATES <table>]
+    [REQUIRES <module_id>]
+    [OBSERVABLE]
+    [TIMEOUT <ms>]
+    <body constructs>
+  END FUNCTION <name> [id=<id>]
 
-  user = QUERY users_table WHERE email == email LIMIT 1
-  IF user IS NULL THEN FAIL AuthError("user_not_found")
-  IF NOT verify_hash(password, user.password_hash) THEN FAIL AuthError("invalid_password")
-  token = generate_token(user.id)
-  PERSIST sessions_table (user_id: user.id, token: token, expires_at: now()+24h)
-  RETURN SessionToken(token: token)
-END FUNCTION login [id=f001]"""
+  PIPELINE <name> [id=<id>]
+    INTENT "<description>"
+    STEP <name>: <construct>
+    [TIMEOUT <ms>]
+  END PIPELINE <name> [id=<id>]
 
-FASTAPI_EXAMPLE = """\
-# ═══ INTL:BEGIN [id=f001] login ═══
-import logging
-from datetime import datetime, timedelta
+  PATCH <id> [target=<id>]
+    INTENT "<description>"
+    ADD BEFORE: <construct>
+    ADD AFTER: <construct>
+    REPLACE: <old> WITH: <new>
+  END PATCH <id>
 
-logger = logging.getLogger(__name__)
+BODY CONSTRUCTS:
+  QUERY <table> WHERE <cond> [LIMIT n] [ORDER BY <field>]
+  PERSIST <table> (<field>: <val>, ...)
+  IF <cond> THEN <stmt> [ELSE <stmt>]
+  FAIL <ErrorType>("<msg>")
+  RETURN <expr>
+  LOOP <var> IN <collection> DO ... END LOOP
+  EMIT <EventType>(<field>: <val>, ...)
+  SEQUENCE [<stmt>, ...]
+  PARALLEL [<stmt>, ...]
+  TRANSACTION DO ... END TRANSACTION
+  LOCK <resource> DO ... END LOCK
+  FALLBACK TRY <stmt> CATCH <stmt>
+  CACHE GET <key> INTO <var>
+  CACHE SET <key> = <val> [TTL <seconds>]
+  VALIDATE <expr> OR FAIL <ErrorType>("<msg>")
+  PAGINATE <query> PAGE <n> SIZE <m>
+  AGGREGATE <collection> BY <field> [SELECT <exprs>]
+  TRANSFORM <collection> USING <func>
+  CONFIDENCE <expr> THRESHOLD <n>
 
-async def login(email: str, password: str) -> SessionToken:
-    assert len(email) > 0, "email must not be empty"
-    assert len(password) >= 8, "password must be at least 8 chars"
-    user = await db.query(users_table).filter(email=email).first()
-    if user is None:
-        raise AuthError("user_not_found")
-    if not verify_hash(password, user.password_hash):
-        raise AuthError("invalid_password")
-    token = generate_token(user.id)
-    await db.insert(sessions_table, user_id=user.id, token=token,
-                    expires_at=datetime.utcnow() + timedelta(hours=24))
-    logger.info("login: user=%s", user.id)
-    result = SessionToken(token=token)
-    assert result.token is not None
-    return result
-# ═══ INTL:END   [id=f001] login ═══"""
+SENTINEL FORMAT (required in compilation output):
+  # ═══ INTL:BEGIN [id=<id>] <name> ═══
+  <compiled code>
+  # ═══ INTL:END   [id=<id>] <name> ═══
+
+RULES:
+  - Every block MUST have INTENT
+  - Block IDs are globally unique (e.g., f0001, p0001)
+  - PRECONDITION → explicit guard clause in compiled code
+  - POSTCONDITION → assertion in compiled code
+  - MUTATES → actual write/insert/update operation
+  - OBSERVABLE → logging call at entry and key decision points
+  - No TODO, FIXME, stub, or placeholder in compiled output
+"""
+
+
+def _load_spec() -> str:
+    """Load INTL spec from file if available, else use compact inline reference."""
+    if SPEC_PATH.exists():
+        text = SPEC_PATH.read_text(encoding="utf-8")
+        # Use first 6000 chars to keep system prompt manageable
+        if len(text) > 6000:
+            text = text[:6000] + "\n\n[spec truncated — key syntax above covers required constructs]"
+        return text
+    return INTL_SYNTAX_REF
 
 
 def _adapter_display(adapter: str) -> str:
@@ -133,158 +177,360 @@ def _construct_schedule(n: int) -> list[str]:
     return schedule[:n]
 
 
-# ── Delimiter-based prompt format ─────────────────────────────────────────────
-DELIM_SYSTEM    = "<<<SYSTEM>>>"
-DELIM_PROMPT    = "<<<PROMPT>>>"
-DELIM_COMPLETION = "<<<COMPLETION>>>"
-DELIM_END       = "<<<END>>>"
+# ── System prompts ────────────────────────────────────────────────────────────
+
+def _sys_intl_writer(spec: str) -> str:
+    return (
+        "You are an INTL (Intent Language) architect. "
+        "Your job is to write syntactically valid, realistic INTL blocks. "
+        "Follow the specification precisely. "
+        "Every block must have INTENT. Use correct END markers. "
+        "Write complete, production-realistic logic — not toy examples.\n\n"
+        + spec
+    )
 
 
-def _parse_delimited(text: str) -> dict | None:
-    """Parse delimiter-separated response into {system, prompt, completion}."""
-    try:
-        sys_part  = _extract(text, DELIM_SYSTEM,     DELIM_PROMPT)
-        prompt    = _extract(text, DELIM_PROMPT,      DELIM_COMPLETION)
-        completion = _extract(text, DELIM_COMPLETION, DELIM_END)
-        if not sys_part or not prompt or not completion:
-            return None
-        return {"system": sys_part, "prompt": prompt, "completion": completion}
-    except Exception:
+def _sys_compiler(adapter: str) -> str:
+    display = _adapter_display(adapter)
+    return (
+        f"You are the INTL compiler for {display}. "
+        f"Convert INTL blocks to idiomatic, production-ready {display} code. "
+        "Rules:\n"
+        "- Wrap ALL output in INTL:BEGIN / INTL:END sentinels matching the block ID\n"
+        "- PRECONDITION → explicit guard/assertion\n"
+        "- POSTCONDITION → assertion before return\n"
+        "- MUTATES → actual write operation (insert/update/delete)\n"
+        "- OBSERVABLE → structured logging at entry and decision points\n"
+        "- No TODO, FIXME, stub, placeholder, or pass statements\n"
+        "- Return ONLY the compiled code with sentinels — no explanation"
+    )
+
+
+def _sys_patch_compiler(adapter: str) -> str:
+    display = _adapter_display(adapter)
+    return (
+        f"You are the INTL compiler for {display} in PATCH mode. "
+        "Given existing compiled code and an INTL PATCH block, apply the patch with minimal diff. "
+        "Rules:\n"
+        "- Preserve existing code structure — only apply the described change\n"
+        "- Wrap output in INTL:BEGIN / INTL:END sentinels\n"
+        "- No TODO, stub, or placeholder\n"
+        "- Return ONLY the patched code — no explanation"
+    )
+
+
+def _sys_escalation(adapter: str) -> str:
+    display = _adapter_display(adapter)
+    return (
+        f"You are the INTL escalation compiler for {display}. "
+        "Fix the failed compilation output. "
+        "Rules:\n"
+        "- Fix ALL listed failing checks completely\n"
+        "- Wrap output in INTL:BEGIN / INTL:END sentinels\n"
+        "- No TODO, stub, or placeholder\n"
+        "- Return ONLY corrected code — no explanation"
+    )
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+def _validate_intl(text: str) -> tuple[bool, str]:
+    """Check that text looks like a valid INTL block."""
+    text = text.strip()
+    has_block = (
+        text.startswith("FUNCTION ")
+        or text.startswith("PIPELINE ")
+        or text.startswith("PATCH ")
+        or text.startswith("MODULE ")
+    )
+    if not has_block:
+        return False, "missing FUNCTION/PIPELINE/PATCH block header"
+    if "INTENT" not in text:
+        return False, "missing INTENT field"
+    if not any(f"END {kw}" in text for kw in ("FUNCTION", "PIPELINE", "PATCH", "MODULE")):
+        return False, "missing END marker"
+    return True, "ok"
+
+
+def _validate_compiled(text: str) -> tuple[bool, str]:
+    """Check that compiled output has sentinels and no stubs."""
+    text = text.strip()
+    if "INTL:BEGIN" not in text:
+        return False, "missing INTL:BEGIN sentinel"
+    if "INTL:END" not in text:
+        return False, "missing INTL:END sentinel"
+    stub_patterns = ["TODO", "FIXME", "pass  #", "raise NotImplementedError", "stub"]
+    for pat in stub_patterns:
+        if pat in text:
+            return False, f"contains stub/placeholder: {pat!r}"
+    return True, "ok"
+
+
+# ── API call helper ───────────────────────────────────────────────────────────
+
+async def _call(
+    client: anthropic.AsyncAnthropic,
+    system: str,
+    user: str,
+    semaphore: asyncio.Semaphore,
+    context: str = "",
+) -> str | None:
+    """Single API call with retry on rate limit. Returns text or None on failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with semaphore:
+                resp = await client.messages.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+            return resp.content[0].text.strip()
+        except anthropic.RateLimitError:
+            delay = RETRY_DELAY * (2 ** (attempt - 1))
+            logger.warning("%s rate limit — sleeping %ds (attempt %d/%d)", context, delay, attempt, MAX_RETRIES)
+            await asyncio.sleep(delay)
+        except anthropic.APIError as e:
+            logger.warning("%s API error: %s (attempt %d/%d)", context, e, attempt, MAX_RETRIES)
+            await asyncio.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.warning("%s unexpected error: %s (attempt %d/%d)", context, e, attempt, MAX_RETRIES)
+            await asyncio.sleep(RETRY_DELAY)
+    logger.error("%s failed after %d attempts", context, MAX_RETRIES)
+    return None
+
+
+# ── Category generators ───────────────────────────────────────────────────────
+
+async def _generate_pair_A(
+    client: anthropic.AsyncAnthropic,
+    adapter: str,
+    construct: str,
+    idx: int,
+    domain: str,
+    semaphore: asyncio.Semaphore,
+    spec: str,
+) -> dict | None:
+    """Category A: Write INTL → compile to target code. (2 API calls)"""
+    ctx = f"[A/idx={idx}]"
+    display = _adapter_display(adapter)
+    block_id = f"f{idx:04d}"
+
+    # Step 1: Generate valid INTL block
+    writer_prompt = (
+        f"Write a realistic INTL FUNCTION block for the '{domain}' domain.\n"
+        f"Requirements:\n"
+        f"- Block ID: {block_id}\n"
+        f"- Must use the '{construct}' construct prominently in the body\n"
+        f"- Include INTENT, at least one PRECONDITION, at least one MUTATES or READS\n"
+        f"- Be realistic and complete — not a toy example\n"
+        f"- Return ONLY the INTL block, nothing else"
+    )
+    intl_text = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
+    if intl_text is None:
         return None
 
+    ok, reason = _validate_intl(intl_text)
+    if not ok:
+        logger.warning("%s INTL validation failed: %s", ctx, reason)
+        return None
 
-def _extract(text: str, start_tag: str, end_tag: str) -> str:
-    try:
-        start = text.index(start_tag) + len(start_tag)
-        end   = text.index(end_tag, start)
-        return text[start:end].strip()
-    except ValueError:
-        return ""
-
-
-# ── Prompt builders ───────────────────────────────────────────────────────────
-def _prompt_A(adapter: str, construct: str, idx: int, domain: str) -> str:
-    display = _adapter_display(adapter)
-    sys_content = (
-        f"You are the INTL compiler for {display}. "
-        f"Given an INTL block, produce idiomatic, production-ready {display} code. "
-        f"Wrap output in INTL:BEGIN / INTL:END sentinels with the correct block ID."
+    # Step 2: Compile INTL → target code
+    compile_prompt = (
+        f"Compile this INTL block to {display} code:\n\n{intl_text}"
     )
-    return f"""You are generating training data for the INTL compiler system.
+    compiled_text = await _call(client, _sys_compiler(adapter), compile_prompt, semaphore, ctx + " step2")
+    if compiled_text is None:
+        return None
 
-INTL (Intent Language) is a structured specification language. Here is an example INTL block:
+    ok, reason = _validate_compiled(compiled_text)
+    if not ok:
+        logger.warning("%s compiled validation failed: %s", ctx, reason)
+        return None
 
-{INTL_EXAMPLE}
-
-And the corresponding {display} compilation:
-
-{FASTAPI_EXAMPLE}
-
----
-
-YOUR TASK: Generate ONE training pair for the {display} adapter.
-
-Requirements:
-- INTL block MUST use the '{construct}' construct prominently
-- Domain: {domain}
-- Block ID: f{idx:04d}
-- No TODO, FIXME, placeholder, or stub code in completion
-- All PRECONDITION → explicit guard clause in completion
-- All MUTATES → actual write operation
-- OBSERVABLE (if present) → logging call
-- INTL:BEGIN sentinel format: # ═══ INTL:BEGIN [id=f{idx:04d}] <name> ═══
-- INTL:END sentinel format:   # ═══ INTL:END   [id=f{idx:04d}] <name> ═══
-
-Respond using EXACTLY this format (no other text):
-
-{DELIM_SYSTEM}
-{sys_content}
-{DELIM_PROMPT}
-<write a complete INTL FUNCTION block here using the {construct} construct>
-{DELIM_COMPLETION}
-<write idiomatic {display} code here with proper INTL:BEGIN/END sentinels>
-{DELIM_END}"""
+    return {
+        "system": _sys_compiler(adapter),
+        "prompt": intl_text,
+        "completion": compiled_text,
+        "metadata": {"category": "A", "adapter": adapter, "construct": construct, "idx": idx},
+    }
 
 
-def _prompt_B(adapter: str, construct: str, idx: int, domain: str) -> str:
+async def _generate_pair_B(
+    client: anthropic.AsyncAnthropic,
+    adapter: str,
+    construct: str,
+    idx: int,
+    domain: str,
+    semaphore: asyncio.Semaphore,
+    spec: str,
+) -> dict | None:
+    """Category B: Base INTL → compiled + PATCH block → patched code. (4 API calls)"""
+    ctx = f"[B/idx={idx}]"
     display = _adapter_display(adapter)
-    sys_content = (
-        f"You are the INTL compiler for {display} in PATCH mode. "
-        f"Apply the PATCH block to the existing code with minimal diff. "
-        f"Wrap output in INTL:BEGIN / INTL:END sentinels."
+    base_id = f"f{idx:04d}"
+    patch_id = f"p{idx:04d}"
+
+    # Step 1: Generate base INTL
+    writer_prompt = (
+        f"Write a realistic INTL FUNCTION block for the '{domain}' domain.\n"
+        f"Block ID: {base_id}\n"
+        f"Must use '{construct}' in the body. Include INTENT, PRECONDITION, READS or MUTATES.\n"
+        f"Return ONLY the INTL block."
     )
-    return f"""You are generating PATCH training data for the INTL compiler.
+    base_intl = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
+    if base_intl is None:
+        return None
+    ok, reason = _validate_intl(base_intl)
+    if not ok:
+        logger.warning("%s base INTL failed: %s", ctx, reason)
+        return None
 
-A PATCH pair shows: existing compiled code + INTL PATCH block → minimally modified output.
+    # Step 2: Compile base INTL
+    compiled_base = await _call(
+        client, _sys_compiler(adapter),
+        f"Compile this INTL block to {display} code:\n\n{base_intl}",
+        semaphore, ctx + " step2",
+    )
+    if compiled_base is None:
+        return None
+    ok, reason = _validate_compiled(compiled_base)
+    if not ok:
+        logger.warning("%s compiled base failed: %s", ctx, reason)
+        return None
 
-INTL PATCH syntax example:
-PATCH f{idx:04d} [target=f{idx:04d}]
-  INTENT "add rate limiting to the function"
-  ADD BEFORE: rate_limit_check(user_id)
-END PATCH f{idx:04d}
+    # Step 3: Generate PATCH block
+    patch_ideas = [
+        "add rate limiting before the main logic",
+        "add caching to avoid redundant reads",
+        "add an audit log entry on mutation",
+        "add input sanitisation for string fields",
+        "add a retry with exponential backoff on transient failures",
+    ]
+    patch_intent = random.choice(patch_ideas)
+    patch_prompt = (
+        f"Write an INTL PATCH block that targets function {base_id}.\n"
+        f"Patch ID: {patch_id}\n"
+        f"INTENT: \"{patch_intent}\"\n"
+        f"The patch must be specific and actionable — not vague.\n"
+        f"Return ONLY the INTL PATCH block."
+    )
+    patch_intl = await _call(client, _sys_intl_writer(spec), patch_prompt, semaphore, ctx + " step3")
+    if patch_intl is None:
+        return None
+    if "PATCH" not in patch_intl or "INTENT" not in patch_intl:
+        logger.warning("%s PATCH block missing PATCH/INTENT", ctx)
+        return None
 
-Domain: {domain}
-Construct to patch: {construct}
-Block ID: f{idx:04d}
-Target language: {display}
+    # Step 4: Apply patch
+    apply_prompt = (
+        f"Apply this INTL PATCH to the existing {display} code.\n\n"
+        f"EXISTING CODE:\n{compiled_base}\n\n"
+        f"INTL PATCH:\n{patch_intl}"
+    )
+    patched_code = await _call(
+        client, _sys_patch_compiler(adapter), apply_prompt, semaphore, ctx + " step4",
+    )
+    if patched_code is None:
+        return None
+    ok, reason = _validate_compiled(patched_code)
+    if not ok:
+        logger.warning("%s patched code failed: %s", ctx, reason)
+        return None
 
-Respond using EXACTLY this format (no other text):
-
-{DELIM_SYSTEM}
-{sys_content}
-{DELIM_PROMPT}
-<existing {display} code in INTL:BEGIN/END sentinels>
-
-<INTL PATCH block requesting a {construct}-related change>
-{DELIM_COMPLETION}
-<minimally modified {display} code — only the PATCH change applied — in INTL:BEGIN/END sentinels>
-{DELIM_END}"""
+    # Training pair: prompt = existing code + PATCH block, completion = patched code
+    training_prompt = f"{compiled_base}\n\n{patch_intl}"
+    return {
+        "system": _sys_patch_compiler(adapter),
+        "prompt": training_prompt,
+        "completion": patched_code,
+        "metadata": {"category": "B", "adapter": adapter, "construct": construct, "idx": idx},
+    }
 
 
-def _prompt_C(adapter: str, construct: str, idx: int, domain: str) -> str:
+async def _generate_pair_C(
+    client: anthropic.AsyncAnthropic,
+    adapter: str,
+    construct: str,
+    idx: int,
+    domain: str,
+    semaphore: asyncio.Semaphore,
+    spec: str,
+) -> dict | None:
+    """Category C: INTL + broken compile + failing checks → corrected code. (3 API calls)"""
+    ctx = f"[C/idx={idx}]"
     display = _adapter_display(adapter)
-    sys_content = (
-        f"You are the INTL escalation compiler for {display}. "
-        f"Fix the failed output. Return ONLY code wrapped in INTL sentinels."
+    block_id = f"f{idx:04d}"
+
+    # Step 1: Generate INTL block
+    writer_prompt = (
+        f"Write a realistic INTL FUNCTION block for the '{domain}' domain.\n"
+        f"Block ID: {block_id}\n"
+        f"Must use '{construct}'. Include INTENT, PRECONDITION, MUTATES.\n"
+        f"Return ONLY the INTL block."
     )
-    return f"""You are generating error-correction training data for the INTL compiler.
+    intl_text = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
+    if intl_text is None:
+        return None
+    ok, reason = _validate_intl(intl_text)
+    if not ok:
+        logger.warning("%s INTL failed: %s", ctx, reason)
+        return None
 
-A Category C pair shows: INTL block + failed output + error → corrected output.
+    # Step 2: Generate a realistically broken compilation
+    error_types = [
+        "missing INTL:BEGIN/END sentinels",
+        "PRECONDITION not enforced — missing guard clause",
+        "MUTATES field not implemented — no actual write operation",
+        "OBSERVABLE field ignored — no logging call present",
+        "contains a TODO or stub instead of real implementation",
+    ]
+    chosen_error = random.choice(error_types)
+    broken_prompt = (
+        f"Compile this INTL block to {display} code, but deliberately introduce this flaw: {chosen_error}\n"
+        f"The output should look plausible but have that specific problem.\n\n"
+        f"{intl_text}"
+    )
+    broken_code = await _call(
+        client, _sys_compiler(adapter), broken_prompt, semaphore, ctx + " step2",
+    )
+    if broken_code is None:
+        return None
 
-Domain: {domain}
-Construct: {construct}
-Block ID: f{idx:04d}
-Target language: {display}
+    # Step 3: Fix the broken code
+    fix_prompt = (
+        f"The following {display} compilation of an INTL block has a flaw.\n\n"
+        f"INTL BLOCK:\n{intl_text}\n\n"
+        f"FAILED OUTPUT:\n{broken_code}\n\n"
+        f"FAILING CHECK: {chosen_error}\n\n"
+        f"Return the fully corrected {display} code with proper INTL:BEGIN/END sentinels."
+    )
+    corrected_code = await _call(
+        client, _sys_escalation(adapter), fix_prompt, semaphore, ctx + " step3",
+    )
+    if corrected_code is None:
+        return None
+    ok, reason = _validate_compiled(corrected_code)
+    if not ok:
+        logger.warning("%s corrected code failed: %s", ctx, reason)
+        return None
 
-The failed code must have 1-2 realistic errors (missing guard, wrong type, TODO stub, or missing sentinel).
-The correction must fix ALL errors completely.
-
-Respond using EXACTLY this format (no other text):
-
-{DELIM_SYSTEM}
-{sys_content}
-{DELIM_PROMPT}
-<INTL block with {construct}>
-
-# PREVIOUS ATTEMPT (failed):
-<broken {display} code with 1-2 realistic errors>
-
-# FAILING CHECKS: <check name(s) and brief error description>
-{DELIM_COMPLETION}
-<corrected {display} code with all issues fixed, in proper INTL:BEGIN/END sentinels>
-{DELIM_END}"""
+    # Training pair: prompt = INTL + broken output + check, completion = corrected
+    training_prompt = (
+        f"{intl_text}\n\n"
+        f"# PREVIOUS ATTEMPT (failed):\n{broken_code}\n\n"
+        f"# FAILING CHECK: {chosen_error}"
+    )
+    return {
+        "system": _sys_escalation(adapter),
+        "prompt": training_prompt,
+        "completion": corrected_code,
+        "metadata": {"category": "C", "adapter": adapter, "construct": construct, "idx": idx},
+    }
 
 
-def _build_prompt(adapter: str, category: str, construct: str, idx: int) -> str:
-    domain = random.choice(DOMAINS)
-    if category == "A":
-        return _prompt_A(adapter, construct, idx, domain)
-    if category == "B":
-        return _prompt_B(adapter, construct, idx, domain)
-    return _prompt_C(adapter, construct, idx, domain)
+# ── Dispatcher ────────────────────────────────────────────────────────────────
 
-
-# ── Core async generator ──────────────────────────────────────────────────────
 async def _generate_one(
     client: anthropic.AsyncAnthropic,
     adapter: str,
@@ -292,64 +538,19 @@ async def _generate_one(
     construct: str,
     idx: int,
     semaphore: asyncio.Semaphore,
+    spec: str,
 ) -> dict | None:
-    prompt = _build_prompt(adapter, category, construct, idx)
+    domain = random.choice(DOMAINS)
+    if category == "A":
+        return await _generate_pair_A(client, adapter, construct, idx, domain, semaphore, spec)
+    if category == "B":
+        return await _generate_pair_B(client, adapter, construct, idx, domain, semaphore, spec)
+    return await _generate_pair_C(client, adapter, construct, idx, domain, semaphore, spec)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with semaphore:
-                resp = await client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            raw = resp.content[0].text
-            pair = _parse_delimited(raw)
 
-            if pair is None:
-                logger.warning("[%d/%d] idx=%d delimiter parse failed — raw[:200]: %s",
-                               attempt, MAX_RETRIES, idx, raw[:200])
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
-                return None
+# ── Batch orchestrator ────────────────────────────────────────────────────────
 
-            # Basic quality gate: prompt must look like INTL, completion must have sentinel
-            if "FUNCTION" not in pair["prompt"] and "PIPELINE" not in pair["prompt"] and "PATCH" not in pair["prompt"]:
-                logger.warning("[%d/%d] idx=%d prompt doesn't contain INTL construct", attempt, MAX_RETRIES, idx)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
-                return None
-
-            if "INTL:BEGIN" not in pair["completion"] or "INTL:END" not in pair["completion"]:
-                logger.warning("[%d/%d] idx=%d completion missing sentinels", attempt, MAX_RETRIES, idx)
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(RETRY_DELAY)
-                    continue
-                return None
-
-            pair["metadata"] = {
-                "category": category,
-                "adapter": adapter,
-                "construct": construct,
-                "idx": idx,
-            }
-            return pair
-
-        except anthropic.RateLimitError:
-            wait = RETRY_DELAY * attempt * 2
-            logger.warning("[%d/%d] idx=%d rate limited — sleeping %ds", attempt, MAX_RETRIES, idx, wait)
-            await asyncio.sleep(wait)
-        except anthropic.APIError as e:
-            logger.warning("[%d/%d] idx=%d API error: %s", attempt, MAX_RETRIES, idx, e)
-            await asyncio.sleep(RETRY_DELAY)
-        except Exception as e:
-            logger.warning("[%d/%d] idx=%d unexpected: %s", attempt, MAX_RETRIES, idx, e)
-            await asyncio.sleep(RETRY_DELAY)
-
-    logger.error("idx=%d failed after %d attempts", idx, MAX_RETRIES)
-    return None
+CHECKPOINT_INTERVAL = 50  # write checkpoint every N successful pairs
 
 
 async def _generate_all(
@@ -359,41 +560,48 @@ async def _generate_all(
     checkpoint_path: Path,
 ) -> list[dict]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    client  = anthropic.AsyncAnthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(api_key=api_key)
     semaphore = asyncio.Semaphore(CONCURRENCY)
+    spec = _load_spec()
 
     constructs = _construct_schedule(total)
     categories = [_pick_category() for _ in range(total)]
 
     tasks = [
-        _generate_one(client, adapter, categories[i], constructs[i], offset + i, semaphore)
+        _generate_one(client, adapter, categories[i], constructs[i], offset + i, semaphore, spec)
         for i in range(total)
     ]
 
     pairs: list[dict] = []
     failed = 0
-    done   = 0
+    done = 0
+    t_start = time.time()
 
     for coro in asyncio.as_completed(tasks):
         result = await coro
-        done  += 1
+        done += 1
         if result is not None:
             pairs.append(result)
-            if len(pairs) % 10 == 0:
+            if len(pairs) % CHECKPOINT_INTERVAL == 0:
                 _write_jsonl(checkpoint_path, pairs)
-                logger.info("  checkpoint: %d/%d — %d good, %d failed",
-                            done, total, len(pairs), failed)
+                elapsed = time.time() - t_start
+                rate = done / elapsed * 60 if elapsed > 0 else 0
+                logger.info(
+                    "checkpoint: %d/%d done — %d good, %d failed — %.1f pairs/min",
+                    done, total, len(pairs), failed, rate,
+                )
         else:
             failed += 1
 
         if done % 10 == 0 or done == total:
-            logger.info("  progress: %d/%d — %d good, %d failed", done, total, len(pairs), failed)
+            logger.info("progress: %d/%d — %d good, %d failed", done, total, len(pairs), failed)
 
-    logger.info("Done: %d good, %d failed / %d total", len(pairs), failed, total)
+    logger.info("Done: %d good, %d failed / %d requested", len(pairs), failed, total)
     return pairs
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
 def generate(
     adapter: str,
     count: int = 1000,
@@ -406,56 +614,58 @@ def generate(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_path = out_dir / "train.jsonl"
-    val_path   = out_dir / "validation.jsonl"
+    val_path = out_dir / "val.jsonl"
     checkpoint = out_dir / "train.jsonl.tmp"
 
     existing_train = _read_jsonl(train_path) if (append and train_path.exists()) else []
-    existing_val   = _read_jsonl(val_path)   if (append and val_path.exists()) else []
+    existing_val = _read_jsonl(val_path) if (append and val_path.exists()) else []
 
-    need_train = max(0, count     - len(existing_train))
-    need_val   = max(0, val_count - len(existing_val))
+    need_train = max(0, count - len(existing_train))
+    need_val = max(0, val_count - len(existing_val))
     total_needed = need_train + need_val
 
     if dry_run:
-        est = (total_needed / CONCURRENCY) * 10 / 60
+        # A=2 calls, B=4 calls, C=3 calls; weighted avg ≈ 2.8 calls/pair
+        avg_calls = 2 * 0.6 + 4 * 0.3 + 3 * 0.1
+        est_calls = int(total_needed * avg_calls)
         logger.info(
-            "[DRY RUN] Would generate %d train + %d val pairs for %s "
-            "(model=%s, workers=%d, est=%.0f min)",
-            need_train, need_val, adapter, MODEL, CONCURRENCY, est,
+            "[DRY RUN] %d train + %d val pairs for %s — ~%d API calls, model=%s, workers=%d",
+            need_train, need_val, adapter, est_calls, MODEL, CONCURRENCY,
         )
         return train_path, val_path
 
     if total_needed == 0:
-        logger.info("Already have %d train + %d val — nothing to do.",
-                    len(existing_train), len(existing_val))
+        logger.info("Already have %d train + %d val — nothing to do.", len(existing_train), len(existing_val))
         return train_path, val_path
 
-    est = (total_needed / CONCURRENCY) * 10 / 60
+    avg_calls = 2 * 0.6 + 4 * 0.3 + 3 * 0.1
     logger.info(
-        "Generating %d pairs for %s — model=%s, workers=%d, est=%.0f min",
-        total_needed, adapter, MODEL, CONCURRENCY, est,
+        "Generating %d pairs for %s — model=%s, workers=%d, ~%.0f API calls total",
+        total_needed, adapter, MODEL, CONCURRENCY, total_needed * avg_calls,
     )
 
     offset = len(existing_train) + len(existing_val)
     new_pairs = asyncio.run(_generate_all(adapter, total_needed, offset, checkpoint))
 
     random.shuffle(new_pairs)
-    new_val   = new_pairs[:need_val]
+    new_val = new_pairs[:need_val]
     new_train = new_pairs[need_val:]
 
     all_train = existing_train + new_train
-    all_val   = existing_val + new_val
+    all_val = existing_val + new_val
 
     _write_jsonl(train_path, all_train)
-    _write_jsonl(val_path,   all_val)
+    _write_jsonl(val_path, all_val)
 
     if checkpoint.exists():
         checkpoint.unlink()
 
     logger.info("Wrote %d train → %s", len(all_train), train_path)
-    logger.info("Wrote %d val   → %s", len(all_val),   val_path)
+    logger.info("Wrote %d val   → %s", len(all_val), val_path)
     return train_path, val_path
 
+
+# ── JSONL helpers ─────────────────────────────────────────────────────────────
 
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
@@ -479,15 +689,16 @@ def _write_jsonl(path: Path, pairs: list[dict]) -> None:
 
 
 # ── HuggingFace upload ────────────────────────────────────────────────────────
+
 def push_to_hub(adapter: str, data_dir: Path | None = None) -> str:
     from huggingface_hub import HfApi
 
-    token   = os.environ.get("HF_TOKEN", "")
+    token = os.environ.get("HF_TOKEN", "")
     hf_user = os.environ.get("HF_USERNAME", "")
     if not token or not hf_user:
         raise RuntimeError("HF_TOKEN and HF_USERNAME must be set")
 
-    folder  = data_dir or (DATA_DIR / adapter)
+    folder = data_dir or (DATA_DIR / adapter)
     repo_id = f"{hf_user}/intl-training-pairs"
 
     api = HfApi(token=token)
@@ -504,17 +715,18 @@ def push_to_hub(adapter: str, data_dir: Path | None = None) -> str:
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+
 def _cli() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    p = argparse.ArgumentParser(description="INTL Training Data Generator")
-    p.add_argument("--adapter",    required=True)
-    p.add_argument("--count",      type=int,  default=1000, help="Target training pairs")
-    p.add_argument("--val",        type=int,  default=200,  help="Target validation pairs")
+    p = argparse.ArgumentParser(description="INTL Training Data Generator (two-step pipeline)")
+    p.add_argument("--adapter", required=True, help="Adapter name, e.g. python_fastapi")
+    p.add_argument("--count", type=int, default=1000, help="Target training pairs")
+    p.add_argument("--val", type=int, default=200, help="Target validation pairs")
     p.add_argument("--output-dir", type=Path, default=None)
-    p.add_argument("--push",       action="store_true")
-    p.add_argument("--append",     action="store_true")
-    p.add_argument("--dry-run",    action="store_true")
+    p.add_argument("--push", action="store_true", help="Push to HuggingFace after generation")
+    p.add_argument("--append", action="store_true", help="Resume from existing output")
+    p.add_argument("--dry-run", action="store_true", help="Estimate without generating")
     args = p.parse_args()
 
     train_path, val_path = generate(
