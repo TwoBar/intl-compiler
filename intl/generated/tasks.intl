@@ -1,0 +1,13 @@
+MODULE tasks [id=m001]
+TARGET    "src/tasks.py"
+PROFILE   python_fastapi
+NAMESPACE "app.tasks"
+
+FUNCTION create_task [id=f001]
+INTENT       "create a new task and persist it"
+PRECONDITION title.length > 0
+POSTCONDITION result IS NOT NULL
+MUTATES      tasks_table
+PERSIST tasks_table INSERT (title: title)
+RETURN Task(title: title)
+END FUNCTION create_task [id=f001]
