@@ -379,14 +379,14 @@ async def _generate_all(
         done  += 1
         if result is not None:
             pairs.append(result)
-            if len(pairs) % 50 == 0:
+            if len(pairs) % 10 == 0:
                 _write_jsonl(checkpoint_path, pairs)
                 logger.info("  checkpoint: %d/%d — %d good, %d failed",
                             done, total, len(pairs), failed)
         else:
             failed += 1
 
-        if done % 25 == 0 or done == total:
+        if done % 10 == 0 or done == total:
             logger.info("  progress: %d/%d — %d good, %d failed", done, total, len(pairs), failed)
 
     logger.info("Done: %d good, %d failed / %d total", len(pairs), failed, total)
