@@ -1,0 +1,216 @@
+// INTL Grammar — Lark EBNF
+// Covers all 24 constructs from §2.3 + MODULE, FUNCTION, PIPELINE, TYPE, PATCH blocks
+
+start: _NL* module_decl (_NL* block)* _NL*
+
+// ─── MODULE ───
+module_decl: "MODULE" NAME id_tag _NL module_field+
+module_field: target_field
+            | profile_field
+            | namespace_field
+            | requires_field
+            | version_field
+
+target_field:    "TARGET"    QUOTED_STRING _NL
+profile_field:   "PROFILE"   NAME _NL
+namespace_field: "NAMESPACE" QUOTED_STRING _NL
+requires_field:  "REQUIRES"  name_list _NL
+version_field:   "VERSION"   QUOTED_STRING _NL
+
+// ─── Top-level blocks ───
+block: function_block
+     | pipeline_block
+     | type_block
+     | patch_block
+
+// ─── FUNCTION ───
+function_block: "FUNCTION" NAME id_tag _NL function_field* body_stmt* "END" "FUNCTION" NAME id_tag _NL?
+function_field: intent_field
+              | precondition_field
+              | postcondition_field
+              | reads_field
+              | mutates_field
+              | emits_field
+              | observable_field
+              | confidence_field
+              | timeout_field
+
+intent_field:        "INTENT"        QUOTED_STRING _NL
+precondition_field:  "PRECONDITION"  expression _NL
+postcondition_field: "POSTCONDITION" expression _NL
+reads_field:         "READS"         NAME _NL
+mutates_field:       "MUTATES"       NAME _NL
+emits_field:         "EMITS"         NAME _NL
+observable_field:    "OBSERVABLE"    _NL
+confidence_field:    "CONFIDENCE"    NUMBER _NL
+timeout_field:       "TIMEOUT"       DURATION _NL
+
+// ─── PIPELINE ───
+pipeline_block: "PIPELINE" NAME id_tag _NL function_field* body_stmt* "END" "PIPELINE" NAME id_tag _NL?
+
+// ─── TYPE ───
+type_block: "TYPE" NAME id_tag _NL type_field* "END" "TYPE" NAME id_tag _NL?
+type_field: field_decl
+          | constraint_decl
+
+field_decl:      "FIELD" NAME ":" type_expr field_modifier* _NL
+constraint_decl: "CONSTRAINT" expression _NL
+
+field_modifier: "NOT" "NULL" -> not_null
+              | "DEFAULT" expression -> default_val
+
+type_expr: NAME "(" NUMBER ")" -> parameterized_type
+         | NAME "[" "]"        -> list_type
+         | NAME "?"            -> optional_type
+         | "Map" "<" NAME "," NAME ">" -> map_type
+         | NAME                -> simple_type
+
+// ─── PATCH ───
+patch_block: "PATCH" patch_target NAME id_tag _NL patch_field* patch_op* "END" "PATCH" patch_target NAME id_tag _NL?
+patch_target: "FUNCTION" -> patch_function
+            | "PIPELINE" -> patch_pipeline
+
+patch_field: intent_field
+           | "INSERT" "PRECONDITION" QUOTED_STRING _NL    -> insert_precondition
+           | "REMOVE" "PRECONDITION" QUOTED_STRING _NL    -> remove_precondition
+
+patch_op: "INSERT" patch_position _NL body_stmt+ -> patch_insert
+        | "REPLACE" patch_position _NL body_stmt+ -> patch_replace
+        | "REMOVE" patch_position _NL              -> patch_remove
+
+patch_position: "AFTER" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING  -> after_line
+              | "BEFORE" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING -> before_line
+              | "AT" "line" "WHERE" "intent" "MATCHES" QUOTED_STRING     -> at_line
+
+// ─── Body Statements (24 constructs) ───
+body_stmt: query_stmt
+         | persist_insert_stmt
+         | persist_update_stmt
+         | persist_delete_stmt
+         | await_stmt
+         | call_stmt
+         | if_stmt
+         | fail_stmt
+         | return_stmt
+         | sequence_block
+         | parallel_block
+         | fallback_block
+         | loop_stmt
+         | emit_stmt
+         | subscribe_block
+         | cache_get_stmt
+         | cache_set_stmt
+         | transaction_block
+         | validate_stmt
+         | paginate_stmt
+         | aggregate_stmt
+         | transform_stmt
+         | lock_block
+         | assign_stmt
+
+// ─── Data constructs ───
+query_stmt: NAME "=" "QUERY" NAME "WHERE" expression ("LIMIT" expression)? _NL
+persist_insert_stmt: "PERSIST" NAME "INSERT" field_list _NL
+persist_update_stmt: "PERSIST" NAME "UPDATE" field_list "WHERE" expression _NL
+persist_delete_stmt: "PERSIST" NAME "DELETE" "WHERE" expression _NL
+paginate_stmt: NAME "=" "PAGINATE" NAME "PAGE" expression "SIZE" expression _NL
+aggregate_stmt: NAME "=" "AGGREGATE" NAME "BY" NAME "COMPUTE" NAME _NL
+transform_stmt: NAME "=" "TRANSFORM" expression "USING" NAME _NL
+transaction_block: "TRANSACTION" _NL body_stmt* "END" "TRANSACTION" _NL?
+
+// ─── Control constructs ───
+call_stmt: NAME "=" "CALL" dotted_name "(" call_args ")" _NL -> call_assign_stmt
+         | "CALL" dotted_name "(" call_args ")" _NL         -> call_bare_stmt
+await_stmt: NAME "=" "AWAIT" "CALL" dotted_name "(" call_args ")" _NL -> await_assign_stmt
+          | "AWAIT" "CALL" dotted_name "(" call_args ")" _NL          -> await_bare_stmt
+if_stmt: "IF" expression "THEN" inline_action _NL -> if_inline
+       | "IF" expression "THEN" _NL body_stmt+ "ELSE" _NL body_stmt+ "END" "IF" _NL? -> if_else
+       | "IF" expression "THEN" _NL body_stmt+ "END" "IF" _NL? -> if_simple
+fail_stmt: "FAIL" NAME "(" QUOTED_STRING ")" _NL
+return_stmt: "RETURN" expression _NL
+
+// ─── Flow constructs ───
+sequence_block: "SEQUENCE" _NL body_stmt* "END" "SEQUENCE" _NL?
+parallel_block: "PARALLEL" _NL body_stmt* "END" "PARALLEL" _NL?
+fallback_block: "FALLBACK" _NL "PRIMARY" ":" _NL body_stmt+ "FALLBACK" ":" _NL body_stmt+ "END" "FALLBACK" _NL?
+loop_stmt: "LOOP" dotted_name "AS" NAME "DO" _NL body_stmt* "END" "LOOP" _NL?
+
+// ─── Event constructs ───
+emit_stmt: "EMIT" NAME "(" field_list ")" _NL
+subscribe_block: "SUBSCRIBE" NAME "DO" _NL body_stmt* "END" "SUBSCRIBE" _NL?
+
+// ─── Cache constructs ───
+cache_get_stmt: "CACHE" "GET" expression "AS" NAME _NL
+cache_set_stmt: "CACHE" "SET" expression "=" expression "TTL" DURATION _NL
+
+// ─── Guard constructs ───
+validate_stmt: "VALIDATE" name_list "AGAINST" NAME _NL
+
+// ─── Concurrency constructs ───
+lock_block: "LOCK" NAME "DO" _NL body_stmt* "END" "LOCK" _NL?
+
+// ─── Assignment (catch-all for body lines like `token = generate_token(...)`) ───
+assign_stmt: NAME "=" expression _NL
+
+// ─── Inline action (for single-line IF) ───
+inline_action: "FAIL" NAME "(" QUOTED_STRING ")"   -> inline_fail
+             | "RETURN" expression                   -> inline_return
+             | "CALL" dotted_name "(" call_args ")" -> inline_call
+
+// ─── Call arguments: either field_list style (name: expr) or positional (expr, expr) ───
+call_args: field_pair ("," field_pair)* -> call_kwargs
+         | arg_list                     -> call_positional
+         |                              -> call_empty
+
+// ─── Expressions ───
+expression: or_expr
+
+or_expr: and_expr ("OR" and_expr)*
+and_expr: not_expr ("AND" not_expr)*
+not_expr: "NOT" not_expr -> not_op
+        | comparison
+
+comparison: addition (comp_op addition)?
+comp_op: "IS" "NOT" -> is_not
+       | "IS"       -> is_op
+       | "=="       -> eq
+       | "!="       -> neq
+       | ">="       -> gte
+       | "<="       -> lte
+       | ">"        -> gt
+       | "<"        -> lt
+
+addition: multiplication (ADD_OP multiplication)*
+ADD_OP: "+" | "-"
+
+multiplication: atom (MUL_OP atom)*
+MUL_OP: "*" | "/"
+
+atom: QUOTED_STRING                              -> string_literal
+    | NUMBER                                     -> number_literal
+    | DURATION                                   -> duration_literal
+    | "TRUE"                                     -> true_literal
+    | "FALSE"                                    -> false_literal
+    | "NULL"                                     -> null_literal
+    | "NOW" "(" ")"                              -> now_call
+    | dotted_name "(" call_args ")"              -> func_call
+    | dotted_name                                -> ref
+    | "(" expression ")"                         -> paren_expr
+
+// ─── Common rules ───
+id_tag: "[" "id" "=" NAME "]"
+dotted_name: NAME ("." NAME)*
+name_list: NAME (NAME)*
+field_list: "(" field_pair ("," field_pair)* ")"
+field_pair: NAME ":" expression
+arg_list: expression ("," expression)*
+
+// ─── Terminals ───
+NAME: /[a-zA-Z_][a-zA-Z0-9_]*/
+QUOTED_STRING: "\"" /[^"]*/ "\""
+NUMBER: /[0-9]+(\.[0-9]+)?/
+DURATION: /[0-9]+[smhd]/
+_NL: /(\s*\n)+/
+
+%import common.WS_INLINE
+%ignore WS_INLINE
