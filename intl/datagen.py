@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from pathlib import Path
 
@@ -41,11 +42,13 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-MODEL       = "claude-sonnet-4-6"
-MAX_TOKENS  = 2048
-CONCURRENCY = 3      # 3 parallel pairs × up to 4 calls each = ≤12 concurrent requests
-MAX_RETRIES = 3
-RETRY_DELAY = 10     # base delay — doubles on rate limit
+MODEL        = "claude-sonnet-4-6"
+MAX_TOKENS   = 4096   # compiled functions can be long; 2048 was truncating END sentinel
+CONCURRENCY  = 1      # 1 pair at a time — datagen shares API key with the Telegram bot
+MAX_RETRIES  = 5
+RETRY_DELAY  = 20     # base delay — doubles on rate limit
+PAIR_DELAY   = 3.0    # seconds between completed pairs
+BATCH_SIZE   = 3      # INTL functions written per API call (Cat A only)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -234,14 +237,25 @@ def _sys_escalation(adapter: str) -> str:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
+def _extract_intl_block(text: str) -> str:
+    """Strip markdown fences and leading prose, returning just the INTL block."""
+    # Remove opening/closing code fences (```intl, ```INTL, ```, etc.)
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text.strip())
+    text = re.sub(r"\n?```$", "", text.strip())
+    text = text.strip()
+    # Find the first INTL keyword and return from there
+    for keyword in ("FUNCTION ", "PIPELINE ", "PATCH ", "MODULE "):
+        idx = text.find(keyword)
+        if idx != -1:
+            return text[idx:].strip()
+    return text
+
+
 def _validate_intl(text: str) -> tuple[bool, str]:
     """Check that text looks like a valid INTL block."""
     text = text.strip()
-    has_block = (
-        text.startswith("FUNCTION ")
-        or text.startswith("PIPELINE ")
-        or text.startswith("PATCH ")
-        or text.startswith("MODULE ")
+    has_block = any(
+        kw in text for kw in ("FUNCTION ", "PIPELINE ", "PATCH ", "MODULE ")
     )
     if not has_block:
         return False, "missing FUNCTION/PIPELINE/PATCH block header"
@@ -250,6 +264,13 @@ def _validate_intl(text: str) -> tuple[bool, str]:
     if not any(f"END {kw}" in text for kw in ("FUNCTION", "PIPELINE", "PATCH", "MODULE")):
         return False, "missing END marker"
     return True, "ok"
+
+
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences from compiled output."""
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text.strip())
+    text = re.sub(r"\n?```$", "", text.strip())
+    return text.strip()
 
 
 def _validate_compiled(text: str) -> tuple[bool, str]:
@@ -310,30 +331,34 @@ async def _generate_pair_A(
     domain: str,
     semaphore: asyncio.Semaphore,
     spec: str,
+    prefetched_intl: str | None = None,
 ) -> dict | None:
-    """Category A: Write INTL → compile to target code. (2 API calls)"""
+    """Category A: Write INTL → compile to target code.
+    If prefetched_intl is provided (from batch), skip Step 1. (1–2 API calls)"""
     ctx = f"[A/idx={idx}]"
     display = _adapter_display(adapter)
     block_id = f"f{idx:04d}"
 
-    # Step 1: Generate valid INTL block
-    writer_prompt = (
-        f"Write a realistic INTL FUNCTION block for the '{domain}' domain.\n"
-        f"Requirements:\n"
-        f"- Block ID: {block_id}\n"
-        f"- Must use the '{construct}' construct prominently in the body\n"
-        f"- Include INTENT, at least one PRECONDITION, at least one MUTATES or READS\n"
-        f"- Be realistic and complete — not a toy example\n"
-        f"- Return ONLY the INTL block, nothing else"
-    )
-    intl_text = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
-    if intl_text is None:
-        return None
+    if prefetched_intl is not None:
+        intl_text = prefetched_intl
+        logger.debug("%s using pre-fetched INTL block", ctx)
+    else:
+        # Step 1: Generate valid INTL block (fallback if batch missed this index)
+        writer_prompt = (
+            f"Write a realistic INTL FUNCTION block for the '{domain}' domain.\n"
+            f"Block ID: {block_id}\n"
+            f"Must use the '{construct}' construct. Include INTENT, PRECONDITION, READS or MUTATES.\n"
+            f"Return ONLY the INTL block, nothing else."
+        )
+        intl_text = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
+        if intl_text is None:
+            return None
+        intl_text = _extract_intl_block(intl_text)
 
-    ok, reason = _validate_intl(intl_text)
-    if not ok:
-        logger.warning("%s INTL validation failed: %s", ctx, reason)
-        return None
+        ok, reason = _validate_intl(intl_text)
+        if not ok:
+            logger.warning("%s INTL validation failed: %s", ctx, reason)
+            return None
 
     # Step 2: Compile INTL → target code
     compile_prompt = (
@@ -342,6 +367,7 @@ async def _generate_pair_A(
     compiled_text = await _call(client, _sys_compiler(adapter), compile_prompt, semaphore, ctx + " step2")
     if compiled_text is None:
         return None
+    compiled_text = _strip_fences(compiled_text)
 
     ok, reason = _validate_compiled(compiled_text)
     if not ok:
@@ -381,6 +407,7 @@ async def _generate_pair_B(
     base_intl = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
     if base_intl is None:
         return None
+    base_intl = _extract_intl_block(base_intl)
     ok, reason = _validate_intl(base_intl)
     if not ok:
         logger.warning("%s base INTL failed: %s", ctx, reason)
@@ -394,6 +421,7 @@ async def _generate_pair_B(
     )
     if compiled_base is None:
         return None
+    compiled_base = _strip_fences(compiled_base)
     ok, reason = _validate_compiled(compiled_base)
     if not ok:
         logger.warning("%s compiled base failed: %s", ctx, reason)
@@ -418,6 +446,7 @@ async def _generate_pair_B(
     patch_intl = await _call(client, _sys_intl_writer(spec), patch_prompt, semaphore, ctx + " step3")
     if patch_intl is None:
         return None
+    patch_intl = _extract_intl_block(patch_intl)
     if "PATCH" not in patch_intl or "INTENT" not in patch_intl:
         logger.warning("%s PATCH block missing PATCH/INTENT", ctx)
         return None
@@ -433,6 +462,7 @@ async def _generate_pair_B(
     )
     if patched_code is None:
         return None
+    patched_code = _strip_fences(patched_code)
     ok, reason = _validate_compiled(patched_code)
     if not ok:
         logger.warning("%s patched code failed: %s", ctx, reason)
@@ -472,6 +502,7 @@ async def _generate_pair_C(
     intl_text = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx + " step1")
     if intl_text is None:
         return None
+    intl_text = _extract_intl_block(intl_text)
     ok, reason = _validate_intl(intl_text)
     if not ok:
         logger.warning("%s INTL failed: %s", ctx, reason)
@@ -510,6 +541,7 @@ async def _generate_pair_C(
     )
     if corrected_code is None:
         return None
+    corrected_code = _strip_fences(corrected_code)
     ok, reason = _validate_compiled(corrected_code)
     if not ok:
         logger.warning("%s corrected code failed: %s", ctx, reason)
@@ -529,7 +561,53 @@ async def _generate_pair_C(
     }
 
 
-# ── Dispatcher ────────────────────────────────────────────────────────────────
+# ── Batch INTL writer (Cat A optimisation) ────────────────────────────────────
+
+async def _generate_intl_batch(
+    client: anthropic.AsyncAnthropic,
+    constructs: list[str],
+    idx_start: int,
+    domains: list[str],
+    semaphore: asyncio.Semaphore,
+    spec: str,
+) -> list[str]:
+    """Write N INTL FUNCTION blocks in a single API call. Returns validated blocks (may be < N)."""
+    n = len(constructs)
+    ctx = f"[batch/idx={idx_start}-{idx_start+n-1}]"
+    items = "\n".join(
+        f"Block {i+1}: id=f{idx_start+i:04d}, construct='{constructs[i]}', domain='{domains[i]}'"
+        for i in range(n)
+    )
+    writer_prompt = (
+        f"Write {n} separate, realistic INTL FUNCTION blocks — one for each item below.\n"
+        f"Separate blocks with a line containing only '---'.\n\n"
+        f"{items}\n\n"
+        f"Each block must:\n"
+        f"- Use the specified block ID exactly\n"
+        f"- Use the specified construct prominently in the body\n"
+        f"- Include INTENT, at least one PRECONDITION, and READS or MUTATES\n"
+        f"- Be complete and realistic — not a toy example\n"
+        f"Return ONLY the {n} blocks separated by '---', nothing else."
+    )
+    raw = await _call(client, _sys_intl_writer(spec), writer_prompt, semaphore, ctx)
+    if raw is None:
+        return []
+
+    blocks = []
+    for chunk in raw.split("---"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        extracted = _extract_intl_block(chunk)
+        ok, reason = _validate_intl(extracted)
+        if ok:
+            blocks.append(extracted)
+        else:
+            logger.warning("%s skipping block: %s", ctx, reason)
+    return blocks
+
+
+# ── Single pair dispatcher ────────────────────────────────────────────────────
 
 async def _generate_one(
     client: anthropic.AsyncAnthropic,
@@ -539,10 +617,13 @@ async def _generate_one(
     idx: int,
     semaphore: asyncio.Semaphore,
     spec: str,
+    prefetched_intl: str | None = None,
 ) -> dict | None:
     domain = random.choice(DOMAINS)
     if category == "A":
-        return await _generate_pair_A(client, adapter, construct, idx, domain, semaphore, spec)
+        return await _generate_pair_A(
+            client, adapter, construct, idx, domain, semaphore, spec, prefetched_intl
+        )
     if category == "B":
         return await _generate_pair_B(client, adapter, construct, idx, domain, semaphore, spec)
     return await _generate_pair_C(client, adapter, construct, idx, domain, semaphore, spec)
@@ -567,18 +648,35 @@ async def _generate_all(
     constructs = _construct_schedule(total)
     categories = [_pick_category() for _ in range(total)]
 
-    tasks = [
-        _generate_one(client, adapter, categories[i], constructs[i], offset + i, semaphore, spec)
-        for i in range(total)
-    ]
+    # Pre-batch INTL generation for Cat A indices
+    # Group consecutive Cat A indices into batches of BATCH_SIZE
+    a_indices = [i for i, cat in enumerate(categories) if cat == "A"]
+    intl_pool: dict[int, str] = {}  # idx → pre-generated INTL block
+
+    for batch_start in range(0, len(a_indices), BATCH_SIZE):
+        batch_idx = a_indices[batch_start: batch_start + BATCH_SIZE]
+        batch_constructs = [constructs[i] for i in batch_idx]
+        batch_domains = [random.choice(DOMAINS) for _ in batch_idx]
+        abs_indices = [offset + i for i in batch_idx]
+
+        blocks = await _generate_intl_batch(
+            client, batch_constructs, abs_indices[0], batch_domains, semaphore, spec
+        )
+        for local_i, block in zip(batch_idx, blocks):
+            intl_pool[local_i] = block
+
+        await asyncio.sleep(PAIR_DELAY)
 
     pairs: list[dict] = []
     failed = 0
     done = 0
     t_start = time.time()
 
-    for coro in asyncio.as_completed(tasks):
-        result = await coro
+    for i in range(total):
+        prefetched = intl_pool.get(i)
+        result = await _generate_one(
+            client, adapter, categories[i], constructs[i], offset + i, semaphore, spec, prefetched
+        )
         done += 1
         if result is not None:
             pairs.append(result)
@@ -593,8 +691,10 @@ async def _generate_all(
         else:
             failed += 1
 
-        if done % 10 == 0 or done == total:
+        if done % 5 == 0 or done == total:
             logger.info("progress: %d/%d — %d good, %d failed", done, total, len(pairs), failed)
+
+        await asyncio.sleep(PAIR_DELAY)
 
     logger.info("Done: %d good, %d failed / %d requested", len(pairs), failed, total)
     return pairs
