@@ -11,6 +11,4 @@ build/
 .venv/
 venv/
 *.log
-data/*/train.jsonl
-data/*/val.jsonl
 .DS_Store
