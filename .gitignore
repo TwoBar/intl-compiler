@@ -12,3 +12,4 @@ build/
 venv/
 *.log
 .DS_Store
+node_modules/

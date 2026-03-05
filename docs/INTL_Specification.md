@@ -680,7 +680,7 @@ This document follows semantic versioning. Any change to the construct vocabular
 - Train adapter on Vast.ai using standard hyperparameters (§5.5).
 - Validate against 200-pair held-out set. Must meet threshold for that complexity tier.
 - Push adapter to HuggingFace intl-adapters repo.
-- Update OpenClaw workspace configs/adapters.json with new phase entry.
+- Update INTL workspace configs/adapters.json with new phase entry.
 
 ## 7.3 Modifying an Existing Construct
 
